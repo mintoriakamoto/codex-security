@@ -84,7 +84,7 @@ def _start_scan(tmp_path: Path, *, mode: str = "standard") -> ScanFixture:
     else:
         target.mkdir()
         (target / "app.py").write_text("print('fixture')\n", encoding="utf-8")
-        workspace = create_saved_workspace(state_dir, target, thread_id="scan-parent")
+        workspace = create_saved_workspace(state_dir, target, thread_id="scan-parent", mode=mode)
         workspace_id = str(workspace["id"])
 
     started = start_delivered_scan(
@@ -95,6 +95,16 @@ def _start_scan(tmp_path: Path, *, mode: str = "standard") -> ScanFixture:
         str(tmp_path / "scans"),
         environment=environment,
     )["results"]
+    if mode == "deep":
+        begin_deep_scan(
+            state_dir,
+            "scan-parent",
+            "--scan-id",
+            str(started["scanId"]),
+            "--available-parallelism",
+            "4",
+            environment=environment,
+        )
     with sqlite3.connect(state_dir / "workbench.sqlite3") as connection:
         row = connection.execute(
             "SELECT started_at FROM scans WHERE id = ?", (started["scanId"],)
@@ -199,7 +209,10 @@ def _state_graph(
     sqlite_home = Path(environment["CODEX_SQLITE_HOME"])
     sqlite_home.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(sqlite_home / "state_5.sqlite") as connection:
-        connection.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)")
+        connection.execute(
+            "CREATE TABLE threads "
+            "(id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, cwd TEXT, created_at INTEGER)"
+        )
         connection.execute(
             "CREATE TABLE thread_spawn_edges "
             "(parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL)"
@@ -588,49 +601,15 @@ def test_completion_rejects_non_system_rollout_symlink(tmp_path: Path) -> None:
 
 
 def test_completion_counts_deep_sdk_workers_and_descendants(tmp_path: Path) -> None:
-    state_dir = tmp_path / "workbench-state"
-    target = tmp_path / "target"
-    target.mkdir()
-    environment = {
-        "CODEX_HOME": str(tmp_path / "codex-home"),
-        "CODEX_SQLITE_HOME": str(tmp_path / "codex-sqlite"),
-        "CODEX_STATE_DB": "",
-    }
-    deep = begin_deep_scan(
-        state_dir,
-        "scan-parent",
-        "--target-path",
-        str(target),
-        "--scope",
-        ".",
-        "--scan-root",
-        str(tmp_path / "scans"),
-        "--available-parallelism",
-        "4",
-        environment=environment,
-    )["deepScan"]
-    scan_id = str(deep["scanId"])
-    scan_dir = Path(str(deep["scanDir"]))
-    with sqlite3.connect(state_dir / "workbench.sqlite3") as connection:
-        row = connection.execute("SELECT started_at FROM scans WHERE id = ?", (scan_id,)).fetchone()
-    assert row is not None
-    fixture = ScanFixture(
-        state_dir,
-        target,
-        scan_id,
-        scan_dir,
-        datetime.fromisoformat(row[0].replace("Z", "+00:00")),
-        environment,
-        "deep",
-    )
+    fixture = _start_scan(tmp_path, mode="deep")
     counted = fixture.started_at + timedelta(microseconds=1)
-    artifact = scan_dir / "artifacts" / "usage-worker"
+    artifact = fixture.scan_dir / "artifacts" / "usage-worker"
     artifact.mkdir(parents=True)
     prompt = artifact / "prompt.md"
     prompt.write_text("Review the fixture target.\n", encoding="utf-8")
     upsert_deep_worker(
-        state_dir,
-        scan_id,
+        fixture.state_dir,
+        fixture.scan_id,
         str(uuid.uuid4()),
         "discovery",
         "running",
@@ -638,10 +617,10 @@ def test_completion_counts_deep_sdk_workers_and_descendants(tmp_path: Path) -> N
         str(artifact),
         "--sdk-thread-id",
         "sdk-worker",
-        environment=environment,
+        environment=fixture.environment,
     )
     _state_graph(
-        environment,
+        fixture.environment,
         {
             "scan-parent": _rollout(tmp_path, "scan-parent", [_token_event(counted, 10, 3)]),
             "sdk-worker": _rollout(tmp_path, "sdk-worker", [_token_event(counted, 20, 5)]),
@@ -660,6 +639,66 @@ def test_completion_counts_deep_sdk_workers_and_descendants(tmp_path: Path) -> N
         "source": "codex_rollout",
         **_counts(37, 0, 10),
         "threadCount": 3,
+    }
+
+
+@pytest.mark.parametrize("owner_first", [True, False])
+def test_usage_counts_registered_worker_when_its_parent_rollout_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner_first: bool
+) -> None:
+    fixture = _start_scan(tmp_path)
+    counted = fixture.started_at + timedelta(microseconds=1)
+    inherited = _token_event(counted, 100, 10)
+    _state_graph(
+        fixture.environment,
+        {
+            "scan-parent": _rollout(tmp_path, "scan-parent", [_token_event(counted, 10, 3)]),
+            "missing-parent": tmp_path / "missing.jsonl",
+            "registered-worker": _rollout(
+                tmp_path,
+                "registered-worker",
+                [_token_event(counted, 120, 15)],
+                parent_thread_id="missing-parent",
+                copied_events=[inherited],
+            ),
+            "worker-child": _rollout(
+                tmp_path,
+                "worker-child",
+                [_token_event(counted, 7, 2)],
+                parent_thread_id="registered-worker",
+            ),
+        },
+        [
+            ("scan-parent", "missing-parent"),
+            ("missing-parent", "registered-worker"),
+            ("registered-worker", "worker-child"),
+        ],
+    )
+    for key, value in fixture.environment.items():
+        monkeypatch.setenv(key, value)
+    helper = Path(__file__).resolve().parents[1] / "scripts" / "workbench_scan_usage.py"
+    collect_usage = runpy.run_path(str(helper))["collect_scan_usage"]
+    with sqlite3.connect(fixture.state_dir / "workbench.sqlite3") as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            "UPDATE scans SET continuation_thread_id = ? WHERE id = ?",
+            ("registered-worker", fixture.scan_id),
+        )
+        scan = connection.execute("SELECT * FROM scans WHERE id = ?", (fixture.scan_id,)).fetchone()
+        usage = collect_usage(
+            connection,
+            scan,
+            thread_id="scan-parent" if owner_first else None,
+            completed_at=counted.isoformat(),
+        )
+
+    assert usage == {
+        "coverage": "partial",
+        "source": "codex_rollout",
+        **_counts(37, 0, 10),
+        "threadCount": 3,
+        "missingThreadCount": 1,
+        "warnings": ["rollout_unavailable"],
     }
 
 
@@ -727,3 +766,106 @@ def test_failed_scan_preserves_legacy_failure_behavior(tmp_path: Path) -> None:
     )["scan"]
     assert failed["progress"]["status"] == "failed"
     assert "usage" not in failed
+
+
+@pytest.mark.parametrize("worker_kind", ["discovery", "dedup"])
+def test_completion_recovers_replaced_deep_worker_threads(tmp_path: Path, worker_kind: str) -> None:
+    fixture = _start_scan(tmp_path, mode="deep")
+    counted = fixture.started_at + timedelta(microseconds=1)
+    before_scan = counted - timedelta(days=1)
+    after_scan = counted + timedelta(days=1)
+    artifact = fixture.scan_dir / "artifacts" / "usage-worker"
+    artifact.mkdir(parents=True)
+    prompt = artifact / "prompt.md"
+    prompt.write_text("Review the fixture target.\n", encoding="utf-8")
+    worker_id = str(uuid.uuid4())
+    if worker_kind == "dedup":
+        with sqlite3.connect(fixture.state_dir / "workbench.sqlite3") as connection:
+            connection.execute(
+                "INSERT INTO deep_scan_workers "
+                "(id, scan_id, kind, status, prompt_path, artifact_dir, created_at, updated_at) "
+                "VALUES (?, ?, 'dedup', 'queued', ?, ?, ?, ?)",
+                (
+                    worker_id,
+                    fixture.scan_id,
+                    str(prompt),
+                    str(artifact),
+                    fixture.started_at.isoformat(),
+                    fixture.started_at.isoformat(),
+                ),
+            )
+    for attempt, thread_id in enumerate(
+        ["sdk-first-attempt", "sdk-current-attempt", "sdk-current-attempt"], start=1
+    ):
+        upsert_deep_worker(
+            fixture.state_dir,
+            fixture.scan_id,
+            worker_id,
+            worker_kind,
+            "running",
+            str(prompt),
+            str(artifact),
+            "--attempt",
+            str(attempt),
+            "--sdk-thread-id",
+            thread_id,
+            environment=fixture.environment,
+        )
+    _state_graph(
+        fixture.environment,
+        {
+            "scan-parent": _rollout(tmp_path, "scan-parent", [_token_event(counted, 10, 3)]),
+            "sdk-first-attempt": _rollout(
+                tmp_path, "sdk-first-attempt", [_token_event(counted, 20, 5)]
+            ),
+            "sdk-first-child": _rollout(
+                tmp_path,
+                "sdk-first-child",
+                [_token_event(counted, 7, 2)],
+                parent_thread_id="sdk-first-attempt",
+            ),
+            "sdk-current-attempt": _rollout(
+                tmp_path,
+                "sdk-current-attempt",
+                [_token_event(counted, 20, 5), _token_event(counted, 30, 8)],
+            ),
+            "other-scan-worker": _rollout(
+                tmp_path, "other-scan-worker", [_token_event(counted, 80_000, 20_000)]
+            ),
+            "archived-worker": _rollout(
+                tmp_path, "archived-worker", [_token_event(before_scan, 100, 10)]
+            ),
+            "archived-missing-worker": tmp_path / "archived-missing.jsonl",
+            "later-worker": _rollout(tmp_path, "later-worker", [_token_event(after_scan, 100, 10)]),
+            "later-missing-worker": tmp_path / "later-missing.jsonl",
+        },
+        [("sdk-first-attempt", "sdk-first-child")],
+    )
+    working_directory = artifact if worker_kind == "discovery" else fixture.scan_dir / "artifacts"
+    with sqlite3.connect(
+        Path(fixture.environment["CODEX_SQLITE_HOME"]) / "state_5.sqlite"
+    ) as connection:
+        connection.executemany(
+            "UPDATE threads SET cwd = ?, created_at = ? WHERE id = ?",
+            [
+                (str(working_directory), int(counted.timestamp()), "sdk-first-attempt"),
+                (str(working_directory), int(counted.timestamp()), "sdk-first-child"),
+                (str(working_directory), int(counted.timestamp()), "sdk-current-attempt"),
+                (
+                    str(tmp_path / "other-scan" / "artifacts"),
+                    int(counted.timestamp()),
+                    "other-scan-worker",
+                ),
+                (str(working_directory), int(before_scan.timestamp()), "archived-worker"),
+                (str(working_directory), int(before_scan.timestamp()), "archived-missing-worker"),
+                (str(working_directory), int(after_scan.timestamp()), "later-worker"),
+                (str(working_directory), int(after_scan.timestamp()), "later-missing-worker"),
+            ],
+        )
+    usage = _complete_scan(fixture)["scan"]["usage"]
+    assert usage == {
+        "coverage": "complete",
+        "source": "codex_rollout",
+        **_counts(67, 0, 18),
+        "threadCount": 4,
+    }

@@ -88,7 +88,8 @@ def collect_scan_usage(
     """Count only complete, attributable rollout events inside this scan's window."""
 
     roots = _scan_root_thread_ids(connection, scan, thread_id)
-    if not roots:
+    worker_directories = _scan_worker_directories(connection, scan)
+    if not roots and not worker_directories:
         return _unavailable_usage("scan_thread_unavailable")
 
     state_database = _codex_state_database()
@@ -106,6 +107,9 @@ def collect_scan_usage(
             state_database,
             roots,
             warnings,
+            worker_directories=worker_directories,
+            started_at=started_at,
+            completed_at=stopped_at,
         )
     except (OSError, sqlite3.Error, ValueError):
         return _unavailable_usage("codex_state_unavailable")
@@ -214,6 +218,21 @@ def _scan_execution_thread_ids(connection: sqlite3.Connection, scan: sqlite3.Row
     )
 
 
+def _scan_worker_directories(connection: sqlite3.Connection, scan: sqlite3.Row) -> set[str]:
+    if scan["mode"] != "deep":
+        return set()
+    return {
+        row["artifact_dir"]
+        if row["kind"] == "discovery"
+        else str(Path(scan["scan_dir"]) / "artifacts")
+        for row in connection.execute(
+            "SELECT kind, artifact_dir FROM deep_scan_workers "
+            "WHERE scan_id = ? AND kind IN ('discovery', 'dedup')",
+            (scan["id"],),
+        )
+    }
+
+
 def _codex_state_database() -> Path | None:
     configured_database = os.environ.get("CODEX_STATE_DB", "").strip()
     if configured_database:
@@ -255,6 +274,10 @@ def _discover_rollout_sessions(
     state_database: Path,
     roots: list[str],
     warnings: set[str],
+    *,
+    worker_directories: set[str],
+    started_at: datetime,
+    completed_at: datetime | None,
 ) -> tuple[list[RolloutSession], set[str]]:
     database = sqlite3.connect(
         f"file:{quote(str(state_database), safe='')}?mode=ro",
@@ -273,7 +296,16 @@ def _discover_rollout_sessions(
                 raise ValueError("Codex state graph does not expose the required thread columns.")
         sessions: dict[str, RolloutSession] = {}
         missing_thread_ids: set[str] = set()
-        for root in roots:
+        root_ids = dict.fromkeys(roots)
+        completed_timestamp = int(completed_at.timestamp()) if completed_at is not None else None
+        for directory in sorted(worker_directories):
+            for row in database.execute(
+                "SELECT id FROM threads WHERE cwd = ? AND created_at >= ? "
+                "AND (? IS NULL OR created_at <= ?) ORDER BY id",
+                (directory, int(started_at.timestamp()), completed_timestamp, completed_timestamp),
+            ):
+                root_ids[row["id"]] = None
+        for root in root_ids:
             row = database.execute(
                 "SELECT id, rollout_path FROM threads WHERE id = ?",
                 (root,),
@@ -282,13 +314,12 @@ def _discover_rollout_sessions(
                 missing_thread_ids.add(root)
                 warnings.add("scan_root_unavailable")
                 continue
-            if root not in sessions:
-                path = _rollout_path(row["rollout_path"])
-                if path is None:
-                    missing_thread_ids.add(root)
-                    warnings.add("rollout_unavailable")
-                    continue
-                sessions[root] = RolloutSession(root, None, path)
+            path = _rollout_path(row["rollout_path"])
+            if path is None:
+                missing_thread_ids.add(root)
+                warnings.add("rollout_unavailable")
+                continue
+            sessions[root] = RolloutSession(root, None, path)
             descendants = database.execute(
                 """
                 WITH RECURSIVE descendants(
