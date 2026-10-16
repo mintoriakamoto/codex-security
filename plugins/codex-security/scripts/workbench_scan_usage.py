@@ -301,9 +301,19 @@ def _discover_rollout_sessions(
         root_ids = dict.fromkeys(roots)
         started_millisecond = started_at.replace(microsecond=started_at.microsecond // 1000 * 1000)
         completed_timestamp = int(completed_at.timestamp()) if completed_at is not None else None
+        directory_expression = "cwd"
+        if worker_directories and os.name == "nt":
+            from windows_scan_local_files import _normalized_windows_path
+
+            database.create_function(
+                "codex_security_path_key", 1, _normalized_windows_path, deterministic=True
+            )
+            directory_expression = "codex_security_path_key(cwd)"
+            worker_directories = {_normalized_windows_path(value) for value in worker_directories}
         for directory in sorted(worker_directories):
             for row in database.execute(
-                "SELECT id FROM threads WHERE cwd = ? AND created_at >= ? "
+                "SELECT id FROM threads WHERE cwd IS NOT NULL "
+                f"AND {directory_expression} = ? AND created_at >= ? "
                 "AND (? IS NULL OR created_at <= ?) ORDER BY id",
                 (directory, int(started_at.timestamp()), completed_timestamp, completed_timestamp),
             ):

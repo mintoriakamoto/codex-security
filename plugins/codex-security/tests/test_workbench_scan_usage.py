@@ -9,6 +9,7 @@ import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1530,3 +1531,66 @@ def test_completion_recovers_replaced_deep_worker_threads(tmp_path: Path, worker
         **_counts(67, 0, 18),
         "threadCount": 4,
     }
+
+
+@pytest.mark.cross_platform
+@pytest.mark.parametrize(
+    ("platform_name", "directory", "recorded_cwd", "matches"),
+    [
+        ("nt", r"C:\Scans\Job\output", "\\\\?\\c:\\scans\\job\\OUTPUT\\", True),
+        ("nt", r"C:\Scans\Job\output", "C:/scans/job/output/", True),
+        (
+            "nt",
+            r"\\server\share\Scans\Job\output",
+            "\\\\?\\UNC\\SERVER\\share\\scans\\job\\output\\",
+            True,
+        ),
+        ("nt", r"C:\Scans\Job\output", r"\\?\C:\Scans\Job\other-output", False),
+        ("posix", "/scans/Job/output", "/scans/Job/output", True),
+        ("posix", "/scans/Job/output", "/scans/job/output", False),
+    ],
+)
+def test_worker_discovery_matches_platform_path_spelling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform_name: str,
+    directory: str,
+    recorded_cwd: str,
+    matches: bool,
+) -> None:
+    started = datetime.fromisoformat("2026-01-01T00:00:00+00:00")
+    environment = {"CODEX_SQLITE_HOME": str(tmp_path / "codex-sqlite")}
+    _state_graph(
+        environment,
+        {
+            "current-worker": _rollout(tmp_path, "current-worker", []),
+            "replaced-worker": _rollout(tmp_path, "replaced-worker", []),
+        },
+        [],
+    )
+    state_database = Path(environment["CODEX_SQLITE_HOME"]) / "state_5.sqlite"
+    with sqlite3.connect(state_database) as connection:
+        connection.execute(
+            "UPDATE threads SET cwd = ?, created_at = ? WHERE id = ?",
+            (recorded_cwd, int(started.timestamp()), "replaced-worker"),
+        )
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    helper = runpy.run_path(str(scripts / "workbench_scan_usage.py"))
+    discover = helper["_discover_rollout_sessions"]
+    monkeypatch.setitem(discover.__globals__, "os", SimpleNamespace(name=platform_name))
+    warnings: set[str] = set()
+
+    sessions, missing = discover(
+        state_database,
+        ["current-worker"],
+        warnings,
+        worker_directories={directory},
+        started_at=started,
+        completed_at=started + timedelta(seconds=1),
+    )
+
+    expected_threads = {"current-worker", "replaced-worker"} if matches else {"current-worker"}
+    assert {session.thread_id for session in sessions} == expected_threads
+    assert missing == set()
+    assert warnings == set()
