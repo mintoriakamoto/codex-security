@@ -352,6 +352,15 @@ def test_completion_counts_native_responses_and_compaction_without_legacy_duplic
             _response_event(counted, "scan-parent", "first", 20, 2),
             _token_event(counted, 170, 17),
             compaction,
+            _event(
+                counted,
+                "compacted",
+                {
+                    "message": "Summary.",
+                    "replacement_history": [],
+                    "compaction_response_id": "compaction",
+                },
+            ),
             _token_event(counted, 170, 17),
             compaction,
             _response_event(counted, "scan-parent", "last", 30, 4, turn_usage=(90, 9)),
@@ -365,6 +374,82 @@ def test_completion_counts_native_responses_and_compaction_without_legacy_duplic
         **_counts(140, 0, 14),
         "threadCount": 1,
     }
+
+
+@pytest.mark.parametrize(
+    ("scope", "native", "expected_warning"),
+    [
+        ("before", False, False),
+        ("counted", False, True),
+        ("after", False, False),
+        ("completion_turn", False, True),
+        ("counted", True, False),
+        ("completion_turn", True, False),
+        ("non_model", False, False),
+    ],
+)
+def test_legacy_compaction_usage_is_unverifiable_only_inside_scan_window(
+    tmp_path: Path, scope: str, native: bool, expected_warning: bool
+) -> None:
+    started = datetime.fromisoformat("2026-01-01T00:00:01+00:00")
+    completed = started + timedelta(seconds=1)
+    compacted_at = (
+        started - timedelta(seconds=1)
+        if scope == "before"
+        else completed + timedelta(seconds=1)
+        if scope in {"after", "completion_turn"}
+        else started
+    )
+    marker = _event(compacted_at, "compacted", {"message": "Summary.", "replacement_history": []})
+    if scope == "non_model":
+        marker["payload"]["compaction_response_id"] = None
+    events = [
+        _event(started, "event_msg", {"type": "task_started", "turn_id": "turn-scan-parent"}),
+        _response_event(started, "scan-parent", "compaction", 10, 1)
+        if native
+        else _token_event(started, 10, 1),
+    ]
+    events.insert(0 if scope == "before" else len(events), marker)
+    parent = _rollout(tmp_path, "scan-parent", events)
+    helper = runpy.run_path(
+        str(Path(__file__).resolve().parents[1] / "scripts/workbench_scan_usage.py")
+    )
+
+    usage, warnings = helper["_read_rollout_usage"](
+        helper["RolloutSession"]("scan-parent", None, parent),
+        started_at=started,
+        completed_at=completed,
+        completed_turn_id="turn-scan-parent" if scope == "completion_turn" else None,
+    )
+
+    assert usage == _counts(10, 0, 1)
+    assert warnings == ({"compaction_usage_unavailable"} if expected_warning else set())
+
+
+def test_legacy_compaction_warning_survives_a_later_native_turn(tmp_path: Path) -> None:
+    started = datetime.fromisoformat("2026-01-01T00:00:00+00:00")
+    parent = _rollout(
+        tmp_path,
+        "scan-parent",
+        [
+            _token_event(started, 10, 1),
+            _event(started, "compacted", {"message": "Summary.", "replacement_history": []}),
+            _event(started, "event_msg", {"type": "task_started", "turn_id": "native-turn"}),
+            _response_event(started, "scan-parent", "native", 20, 2, turn_id="native-turn"),
+        ],
+    )
+    helper = runpy.run_path(
+        str(Path(__file__).resolve().parents[1] / "scripts/workbench_scan_usage.py")
+    )
+
+    usage, warnings = helper["_read_rollout_usage"](
+        helper["RolloutSession"]("scan-parent", None, parent),
+        started_at=started,
+        completed_at=started,
+    )
+
+    assert usage == _counts(30, 0, 3)
+    assert warnings == {"compaction_usage_unavailable"}
 
 
 def test_native_usage_respects_scan_window_and_preserves_cache_details(tmp_path: Path) -> None:

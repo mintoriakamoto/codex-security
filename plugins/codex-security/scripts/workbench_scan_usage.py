@@ -525,6 +525,21 @@ def _read_rollout_usage(
                 and payload.get("turn_id") == completed_turn_id
             ):
                 break
+            if event.get("type") == "compacted":
+                timestamp = _timestamp(event.get("timestamp"))
+                if (
+                    timestamp is not None
+                    and timestamp >= started_at
+                    and (
+                        completed_at is None
+                        or timestamp <= completed_at
+                        or (completed_turn_id is not None and current_turn_id == completed_turn_id)
+                    )
+                    and "compaction_response_id" not in payload
+                    and response_usage is None
+                ):
+                    warnings.add("compaction_usage_unavailable")
+                continue
             if event.get("type") == "token_usage_record":
                 if not isinstance(payload.get("thread_id"), str):
                     warnings.add("token_record_invalid")
