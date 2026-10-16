@@ -84,6 +84,7 @@ def collect_scan_usage(
     *,
     thread_id: str | None = None,
     completed_at: str | None = None,
+    completed_turn_id: str | None = None,
 ) -> dict[str, Any]:
     """Count only complete, attributable rollout events inside this scan's window."""
 
@@ -136,6 +137,7 @@ def collect_scan_usage(
                 session,
                 started_at=started_at,
                 completed_at=stopped_at,
+                completed_turn_id=completed_turn_id if session.thread_id == thread_id else None,
             )
         except (OSError, UnicodeError, ValueError):
             missing_thread_ids.add(session.thread_id)
@@ -297,6 +299,7 @@ def _discover_rollout_sessions(
         sessions: dict[str, RolloutSession] = {}
         missing_thread_ids: set[str] = set()
         root_ids = dict.fromkeys(roots)
+        started_millisecond = started_at.replace(microsecond=started_at.microsecond // 1000 * 1000)
         completed_timestamp = int(completed_at.timestamp()) if completed_at is not None else None
         for directory in sorted(worker_directories):
             for row in database.execute(
@@ -319,6 +322,23 @@ def _discover_rollout_sessions(
                 missing_thread_ids.add(root)
                 warnings.add("rollout_unavailable")
                 continue
+            if root not in roots:
+                try:
+                    with path.open("rb") as source:
+                        metadata = json.loads(source.readline())
+                except (OSError, ValueError):
+                    missing_thread_ids.add(root)
+                    warnings.add("rollout_unavailable")
+                    continue
+                if (
+                    isinstance(metadata, dict)
+                    and metadata.get("type") == "session_meta"
+                    and isinstance(payload := metadata.get("payload"), dict)
+                    and (payload.get("id") or payload.get("session_id")) == root
+                    and (created_at := _timestamp(payload.get("timestamp"))) is not None
+                    and created_at < started_millisecond
+                ):
+                    continue
             sessions[root] = RolloutSession(root, None, path)
             descendants = database.execute(
                 """
@@ -409,6 +429,7 @@ def _read_rollout_usage(
     *,
     started_at: datetime,
     completed_at: datetime | None,
+    completed_turn_id: str | None = None,
 ) -> tuple[dict[str, int], set[str]]:
     total = _empty_token_usage()
     warnings: set[str] = set()
@@ -419,6 +440,7 @@ def _read_rollout_usage(
     observed_response_usage = _empty_token_usage()
     response_ids: set[str] = set()
     current_turn_id: str | None = None
+    completed_turn_measured = False
 
     with session.path.open("rb") as source:
         for line_number, raw_line in enumerate(source, start=1):
@@ -467,7 +489,9 @@ def _read_rollout_usage(
                         warnings.add("thread_ownership_unavailable")
                         return total, warnings
                     if task_started_at < started_at or (
-                        completed_at is not None and task_started_at > completed_at
+                        completed_at is not None
+                        and task_started_at > completed_at
+                        and payload.get("turn_id") != completed_turn_id
                     ):
                         warnings.add("thread_outside_scan_window")
                         return total, warnings
@@ -479,6 +503,12 @@ def _read_rollout_usage(
                         previous = inherited_usage
                 continue
             if event.get("type") == "event_msg" and payload.get("type") == "task_started":
+                if (
+                    completed_turn_id is not None
+                    and current_turn_id == completed_turn_id
+                    and payload.get("turn_id") != completed_turn_id
+                ):
+                    break
                 _add_token_usage(
                     total, response_usage if response_usage is not None else legacy_usage
                 )
@@ -488,6 +518,13 @@ def _read_rollout_usage(
                     observed_response_usage = _empty_token_usage()
                 current_turn_id = payload.get("turn_id")
                 continue
+            if (
+                completed_turn_id is not None
+                and event.get("type") == "event_msg"
+                and payload.get("type") == "task_complete"
+                and payload.get("turn_id") == completed_turn_id
+            ):
+                break
             if event.get("type") == "token_usage_record":
                 if not isinstance(payload.get("thread_id"), str):
                     warnings.add("token_record_invalid")
@@ -505,7 +542,10 @@ def _read_rollout_usage(
                 ):
                     warnings.add("token_record_invalid")
                     continue
-                if completed_at is not None and timestamp > completed_at:
+                is_completion_turn = (
+                    completed_turn_id is not None and payload.get("turn_id") == completed_turn_id
+                )
+                if completed_at is not None and timestamp > completed_at and not is_completion_turn:
                     continue
                 if response_usage is None:
                     response_usage = _empty_token_usage()
@@ -520,6 +560,8 @@ def _read_rollout_usage(
                     if turn_usage is not None:
                         observed_response_usage = turn_usage
                     continue
+                if is_completion_turn:
+                    completed_turn_measured = True
                 if turn_usage is not None and any(
                     turn_usage[key] > observed_response_usage[key] for key in TOKEN_FIELDS.values()
                 ):
@@ -542,8 +584,13 @@ def _read_rollout_usage(
             previous = snapshot
             if timestamp < started_at:
                 continue
-            if completed_at is not None and timestamp > completed_at:
+            is_completion_turn = (
+                completed_turn_id is not None and current_turn_id == completed_turn_id
+            )
+            if completed_at is not None and timestamp > completed_at and not is_completion_turn:
                 continue
+            if is_completion_turn:
+                completed_turn_measured = True
             if delta["totalTokens"] <= 0:
                 continue
             _add_token_usage(legacy_usage, delta)
@@ -551,6 +598,8 @@ def _read_rollout_usage(
     _add_token_usage(total, response_usage if response_usage is not None else legacy_usage)
     if not boundary_reached:
         warnings.add("thread_ownership_unavailable")
+    if completed_turn_id is not None and not completed_turn_measured:
+        warnings.add("completion_turn_unavailable")
     return total, warnings
 
 

@@ -6,7 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -166,6 +166,7 @@ def _rollout(
     include_task_start: bool = True,
     include_task_start_timestamp: bool = True,
     task_started_at: datetime | None = None,
+    session_started_at: datetime | None = None,
     copied_events: list[dict[str, Any]] | None = None,
 ) -> Path:
     directory = root / "rollouts"
@@ -181,6 +182,8 @@ def _rollout(
         },
         *(copied_events or []),
     ]
+    if session_started_at is not None:
+        records[0]["payload"]["timestamp"] = session_started_at.isoformat().replace("+00:00", "Z")
     if parent_thread_id is not None and include_task_start:
         event: dict[str, Any] = {
             "type": "event_msg",
@@ -279,7 +282,7 @@ def _counts(
     }
 
 
-def _complete_scan(fixture: ScanFixture) -> dict[str, Any]:
+def _complete_scan(fixture: ScanFixture, *arguments: str) -> dict[str, Any]:
     options: dict[str, Any] = {"relative_path": "app.py"}
     if fixture.mode == "diff":
         assert fixture.diff_target is not None
@@ -299,7 +302,11 @@ def _complete_scan(fixture: ScanFixture) -> dict[str, Any]:
         **options,
     )
     return scan_command(
-        fixture.state_dir, "complete-scan", fixture.scan_id, environment=fixture.environment
+        fixture.state_dir,
+        "complete-scan",
+        fixture.scan_id,
+        *arguments,
+        environment=fixture.environment,
     )
 
 
@@ -1012,6 +1019,230 @@ def test_usage_is_returned_by_completion_without_an_extra_command(tmp_path: Path
     assert "invalid choice" in str(extra_command["stderr"])
 
 
+@pytest.mark.parametrize("native", [False, True])
+def test_host_finalizes_exact_completion_turn_without_changing_artifacts(
+    tmp_path: Path, native: bool
+) -> None:
+    fixture = _start_scan(tmp_path)
+    counted = fixture.started_at + timedelta(microseconds=1)
+    turn_id = "turn-scan-parent"
+    parent = _rollout(
+        tmp_path,
+        "scan-parent",
+        [
+            _event(counted, "event_msg", {"type": "task_started", "turn_id": turn_id}),
+            _response_event(counted, "scan-parent", "initial", 10, 2)
+            if native
+            else _token_event(counted, 10, 2),
+        ],
+    )
+    worker = _rollout(
+        tmp_path,
+        "scan-worker",
+        [_token_event(counted, 20, 3)],
+        parent_thread_id="scan-parent",
+    )
+    _state_graph(
+        fixture.environment,
+        {"scan-parent": parent, "scan-worker": worker},
+        [("scan-parent", "scan-worker")],
+    )
+    initial = _complete_scan(fixture, "--thread-id", "scan-parent", "--turn-id", turn_id)["scan"]
+    completion = {"threadId": "scan-parent", "turnId": turn_id, "finalized": False}
+    assert initial["usage"] == {
+        "coverage": "partial",
+        "source": "codex_rollout",
+        **_counts(30, 0, 5),
+        "threadCount": 2,
+        "warnings": ["turn_in_progress"],
+        "completion": completion,
+    }
+    sealed_files = {
+        name: (fixture.scan_dir / name).read_bytes()
+        for name in ("scan-manifest.json", "findings.json", "coverage.json", "report.md")
+    }
+    with sqlite3.connect(fixture.state_dir / "workbench.sqlite3") as connection:
+        stopped_at = connection.execute(
+            "SELECT completed_at FROM scans WHERE id = ?", (fixture.scan_id,)
+        ).fetchone()[0]
+    late = datetime.fromisoformat(stopped_at.replace("Z", "+00:00")) + timedelta(seconds=1)
+    final_events = (
+        [
+            _response_event(late, "scan-parent", "final-response", 30, 4, turn_usage=(40, 6)),
+            _response_event(late, "scan-parent", "compaction", 50, 5, turn_usage=(90, 11)),
+        ]
+        if native
+        else [_token_event(late, 90, 11)]
+    )
+    with parent.open("a", encoding="utf-8") as output:
+        output.writelines(f"{json.dumps(event)}\n" for event in final_events)
+    mismatched = scan_command(
+        fixture.state_dir,
+        "finalize-scan-usage",
+        fixture.scan_id,
+        "--thread-id",
+        "scan-parent",
+        "--turn-id",
+        "another-turn",
+        environment=fixture.environment,
+        check=False,
+    )
+    assert mismatched["returncode"] != 0
+    assert (
+        scan_command(
+            fixture.state_dir, "get-scan", fixture.scan_id, environment=fixture.environment
+        )["scan"]["usage"]
+        == initial["usage"]
+    )
+    arguments = ("--thread-id", "scan-parent", "--turn-id", turn_id)
+    finalized = scan_command(
+        fixture.state_dir,
+        "finalize-scan-usage",
+        fixture.scan_id,
+        *arguments,
+        environment=fixture.environment,
+    )["scan"]
+    assert finalized["usage"] == {
+        "coverage": "complete",
+        "source": "codex_rollout",
+        **_counts(110, 0, 14),
+        "threadCount": 2,
+        "completion": {**completion, "finalized": True},
+    }
+    later_events = [
+        _event(late, "event_msg", {"type": "task_complete", "turn_id": turn_id}),
+        _event(late, "event_msg", {"type": "task_started", "turn_id": "later-turn"}),
+        _response_event(late, "scan-parent", "later-response", 900, 90, turn_id="later-turn")
+        if native
+        else _token_event(late, 990, 101),
+    ]
+    with parent.open("a", encoding="utf-8") as output:
+        output.writelines(f"{json.dumps(event)}\n" for event in later_events)
+    helper = runpy.run_path(
+        str(Path(__file__).resolve().parents[1] / "scripts/workbench_scan_usage.py")
+    )
+    measured, warnings = helper["_read_rollout_usage"](
+        helper["RolloutSession"]("scan-parent", None, parent),
+        started_at=fixture.started_at,
+        completed_at=datetime.fromisoformat(stopped_at.replace("Z", "+00:00")),
+        completed_turn_id=turn_id,
+    )
+    assert measured == _counts(90, 0, 11)
+    assert warnings == set()
+    assert (
+        scan_command(
+            fixture.state_dir,
+            "finalize-scan-usage",
+            fixture.scan_id,
+            *arguments,
+            environment=fixture.environment,
+        )["scan"]["usage"]
+        == finalized["usage"]
+    )
+    assert {name: (fixture.scan_dir / name).read_bytes() for name in sealed_files} == sealed_files
+
+
+@pytest.mark.parametrize("turn_status", ["completed", "interrupted", "failed"])
+def test_host_final_usage_preserves_missing_worker_warning(
+    tmp_path: Path, turn_status: str
+) -> None:
+    fixture = _start_scan(tmp_path)
+    counted = fixture.started_at + timedelta(microseconds=1)
+    turn_id = "turn-scan-parent"
+    _state_graph(
+        fixture.environment,
+        {
+            "scan-parent": _rollout(
+                tmp_path,
+                "scan-parent",
+                [_response_event(counted, "scan-parent", "final-response", 10, 2)],
+            ),
+            "scan-worker": tmp_path / "missing-worker.jsonl",
+        },
+        [("scan-parent", "scan-worker")],
+    )
+    _complete_scan(fixture, "--thread-id", "scan-parent", "--turn-id", turn_id)
+    usage = scan_command(
+        fixture.state_dir,
+        "finalize-scan-usage",
+        fixture.scan_id,
+        "--thread-id",
+        "scan-parent",
+        "--turn-id",
+        turn_id,
+        "--turn-status",
+        turn_status,
+        environment=fixture.environment,
+    )["scan"]["usage"]
+    assert usage == {
+        "coverage": "partial",
+        "source": "codex_rollout",
+        **_counts(10, 0, 2),
+        "threadCount": 1,
+        "missingThreadCount": 1,
+        "warnings": ["rollout_unavailable"]
+        + ([] if turn_status == "completed" else [f"scan_turn_{turn_status}"]),
+        "completion": {"threadId": "scan-parent", "turnId": turn_id, "finalized": True},
+    }
+
+
+def test_host_final_usage_recovers_initially_unavailable_records(tmp_path: Path) -> None:
+    fixture = _start_scan(tmp_path)
+    arguments = ("--thread-id", "scan-parent", "--turn-id", "turn-scan-parent")
+    initial = _complete_scan(fixture, *arguments)["scan"]["usage"]
+    assert initial["coverage"] == "unavailable"
+    assert initial["completion"]["finalized"] is False
+    _state_graph(
+        fixture.environment,
+        {
+            "scan-parent": _rollout(
+                tmp_path,
+                "scan-parent",
+                [_response_event(fixture.started_at, "scan-parent", "final-response", 10, 2)],
+            )
+        },
+        [],
+    )
+    finalized = scan_command(
+        fixture.state_dir,
+        "finalize-scan-usage",
+        fixture.scan_id,
+        *arguments,
+        environment=fixture.environment,
+    )["scan"]["usage"]
+    assert finalized["coverage"] == "complete"
+    assert finalized["totalTokens"] == 12
+    assert finalized["completion"]["finalized"] is True
+
+
+def test_host_final_usage_does_not_invent_an_unrecorded_completion_turn(tmp_path: Path) -> None:
+    fixture = _start_scan(tmp_path)
+    arguments = ("--thread-id", "scan-parent", "--turn-id", "unrecorded-turn")
+    _state_graph(
+        fixture.environment,
+        {
+            "scan-parent": _rollout(
+                tmp_path,
+                "scan-parent",
+                [_response_event(fixture.started_at, "scan-parent", "earlier-response", 10, 2)],
+            )
+        },
+        [],
+    )
+    _complete_scan(fixture, *arguments)
+    finalized = scan_command(
+        fixture.state_dir,
+        "finalize-scan-usage",
+        fixture.scan_id,
+        *arguments,
+        environment=fixture.environment,
+    )["scan"]["usage"]
+    assert finalized["coverage"] == "partial"
+    assert finalized["totalTokens"] == 12
+    assert finalized["warnings"] == ["completion_turn_unavailable"]
+    assert finalized["completion"]["finalized"] is True
+
+
 def test_failed_scan_preserves_legacy_failure_behavior(tmp_path: Path) -> None:
     fixture = _start_scan(tmp_path)
     counted = fixture.started_at + timedelta(microseconds=1)
@@ -1030,8 +1261,18 @@ def test_failed_scan_preserves_legacy_failure_behavior(tmp_path: Path) -> None:
 @pytest.mark.parametrize("worker_kind", ["discovery", "dedup"])
 def test_completion_recovers_replaced_deep_worker_threads(tmp_path: Path, worker_kind: str) -> None:
     fixture = _start_scan(tmp_path, mode="deep")
+    fixture = replace(
+        fixture,
+        started_at=(fixture.started_at - timedelta(seconds=1)).replace(microsecond=500123),
+    )
+    with sqlite3.connect(fixture.state_dir / "workbench.sqlite3") as connection:
+        connection.execute(
+            "UPDATE scans SET started_at = ? WHERE id = ?",
+            (fixture.started_at.isoformat(), fixture.scan_id),
+        )
     counted = fixture.started_at + timedelta(microseconds=1)
     before_scan = counted - timedelta(days=1)
+    boundary_predecessor = fixture.started_at.replace(microsecond=400000)
     after_scan = counted + timedelta(days=1)
     artifact = fixture.scan_dir / "artifacts" / "usage-worker"
     artifact.mkdir(parents=True)
@@ -1075,7 +1316,10 @@ def test_completion_recovers_replaced_deep_worker_threads(tmp_path: Path, worker
         {
             "scan-parent": _rollout(tmp_path, "scan-parent", [_token_event(counted, 10, 3)]),
             "sdk-first-attempt": _rollout(
-                tmp_path, "sdk-first-attempt", [_token_event(counted, 20, 5)]
+                tmp_path,
+                "sdk-first-attempt",
+                [_token_event(counted, 20, 5)],
+                session_started_at=fixture.started_at.replace(microsecond=500000),
             ),
             "sdk-first-child": _rollout(
                 tmp_path,
@@ -1087,6 +1331,7 @@ def test_completion_recovers_replaced_deep_worker_threads(tmp_path: Path, worker
                 tmp_path,
                 "sdk-current-attempt",
                 [_token_event(counted, 20, 5), _token_event(counted, 30, 8)],
+                session_started_at=before_scan,
             ),
             "other-scan-worker": _rollout(
                 tmp_path, "other-scan-worker", [_token_event(counted, 80_000, 20_000)]
@@ -1095,10 +1340,20 @@ def test_completion_recovers_replaced_deep_worker_threads(tmp_path: Path, worker
                 tmp_path, "archived-worker", [_token_event(before_scan, 100, 10)]
             ),
             "archived-missing-worker": tmp_path / "archived-missing.jsonl",
+            "boundary-archived-worker": _rollout(
+                tmp_path,
+                "boundary-archived-worker",
+                [_token_event(boundary_predecessor, 100, 10)],
+                session_started_at=boundary_predecessor,
+            ),
+            "boundary-archived-child": tmp_path / "boundary-archived-child.jsonl",
             "later-worker": _rollout(tmp_path, "later-worker", [_token_event(after_scan, 100, 10)]),
             "later-missing-worker": tmp_path / "later-missing.jsonl",
         },
-        [("sdk-first-attempt", "sdk-first-child")],
+        [
+            ("sdk-first-attempt", "sdk-first-child"),
+            ("boundary-archived-worker", "boundary-archived-child"),
+        ],
     )
     working_directory = artifact if worker_kind == "discovery" else fixture.scan_dir / "artifacts"
     with sqlite3.connect(
@@ -1117,6 +1372,11 @@ def test_completion_recovers_replaced_deep_worker_threads(tmp_path: Path, worker
                 ),
                 (str(working_directory), int(before_scan.timestamp()), "archived-worker"),
                 (str(working_directory), int(before_scan.timestamp()), "archived-missing-worker"),
+                (
+                    str(working_directory),
+                    int(boundary_predecessor.timestamp()),
+                    "boundary-archived-worker",
+                ),
                 (str(working_directory), int(after_scan.timestamp()), "later-worker"),
                 (str(working_directory), int(after_scan.timestamp()), "later-missing-worker"),
             ],

@@ -1532,7 +1532,8 @@ export function createCodexSecurityServer(): McpServer {
       annotations: writingAnnotations,
       _meta: modelActionMeta,
     },
-    async ({ scanId, handoffClaimToken }) => {
+    async ({ scanId, handoffClaimToken }, extra) => {
+      const turnId = codexTurnMetadataFromExtra(extra)?.turn_id;
       try {
         return scanActionResult(
           await runWorkbench([
@@ -1540,6 +1541,11 @@ export function createCodexSecurityServer(): McpServer {
             "--scan-id",
             scanId,
             ...optionalArg("--claim-token", handoffClaimToken),
+            ...optionalArg("--thread-id", threadIdFromExtra(extra)),
+            ...optionalArg(
+              "--turn-id",
+              typeof turnId === "string" ? turnId : undefined,
+            ),
           ]),
           "Validated and indexed the completed Codex Security scan.",
         );
@@ -1547,6 +1553,35 @@ export function createCodexSecurityServer(): McpServer {
         throw new Error(completionFailureMessage(error));
       }
     },
+  );
+
+  server.registerTool(
+    "finalize_codex_security_scan_usage",
+    {
+      title: "Finalize Codex Security Local Scan Usage",
+      description:
+        "App-only. Record final measured usage after the scan's completion turn has finished. Pass the exact thread and turn returned in usage.completion; do not call while that turn is running.",
+      inputSchema: {
+        ...scanSchema,
+        threadId: z.string().trim().min(1),
+        turnId: z.string().trim().min(1),
+        turnStatus: z.enum(["completed", "interrupted", "failed"]),
+      },
+      annotations: writingAnnotations,
+      _meta: appMeta,
+    },
+    async ({ scanId, threadId, turnId, turnStatus }) =>
+      scanActionResult(
+        await runWorkbench(
+          workbenchArgs("finalize-scan-usage", {
+            scanId,
+            threadId,
+            turnId,
+            turnStatus,
+          }),
+        ),
+        "Recorded final Codex Security scan usage.",
+      ),
   );
 
   server.registerTool(
@@ -2218,18 +2253,25 @@ function threadIdFromExtra(extra: unknown): string | undefined {
   const thread = isJsonObject(metadata?.thread) ? metadata.thread : undefined;
   if (typeof thread?.id === "string" && thread.id.trim())
     return thread.id.trim();
-  return undefined;
+  const threadId = codexTurnMetadataFromExtra(extra)?.thread_id;
+  return typeof threadId === "string" && threadId.trim()
+    ? threadId.trim()
+    : undefined;
+}
+
+function codexTurnMetadataFromExtra(extra: unknown): JsonObject | undefined {
+  const metadata = requestMetadataFromExtra(extra);
+  return isJsonObject(metadata?.["x-codex-turn-metadata"])
+    ? metadata["x-codex-turn-metadata"]
+    : undefined;
 }
 
 function codexModelSettingsFromExtra(extra: unknown): {
   model?: string;
   reasoningEffort?: string;
 } {
-  const metadata = requestMetadataFromExtra(extra);
   // Codex supplies the already-resolved runtime model and effective effort on every MCP call.
-  const turnMetadata = isJsonObject(metadata?.["x-codex-turn-metadata"])
-    ? metadata["x-codex-turn-metadata"]
-    : undefined;
+  const turnMetadata = codexTurnMetadataFromExtra(extra);
   const model =
     typeof turnMetadata?.model === "string"
       ? turnMetadata.model.trim()
