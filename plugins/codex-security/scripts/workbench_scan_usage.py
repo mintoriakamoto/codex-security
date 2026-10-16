@@ -414,6 +414,11 @@ def _read_rollout_usage(
     warnings: set[str] = set()
     previous = _empty_token_usage()
     boundary_reached = False
+    legacy_usage = _empty_token_usage()
+    response_usage: dict[str, int] | None = None
+    observed_response_usage = _empty_token_usage()
+    response_ids: set[str] = set()
+    current_turn_id: str | None = None
 
     with session.path.open("rb") as source:
         for line_number, raw_line in enumerate(source, start=1):
@@ -467,10 +472,59 @@ def _read_rollout_usage(
                         warnings.add("thread_outside_scan_window")
                         return total, warnings
                     boundary_reached = True
+                    current_turn_id = payload.get("turn_id")
                 elif event.get("type") == "event_msg" and payload.get("type") == "token_count":
                     inherited_usage = _token_snapshot(payload)
                     if inherited_usage is not None:
                         previous = inherited_usage
+                continue
+            if event.get("type") == "event_msg" and payload.get("type") == "task_started":
+                _add_token_usage(
+                    total, response_usage if response_usage is not None else legacy_usage
+                )
+                legacy_usage = _empty_token_usage()
+                response_usage = None
+                if payload.get("turn_id") != current_turn_id:
+                    observed_response_usage = _empty_token_usage()
+                current_turn_id = payload.get("turn_id")
+                continue
+            if event.get("type") == "token_usage_record":
+                if not isinstance(payload.get("thread_id"), str):
+                    warnings.add("token_record_invalid")
+                    continue
+                if payload.get("thread_id") != session.thread_id:
+                    continue
+                timestamp = _timestamp(event.get("timestamp"))
+                usage = _usage_counts(payload.get("usage"))
+                response_id = payload.get("response_id")
+                if (
+                    timestamp is None
+                    or usage is None
+                    or not isinstance(response_id, str)
+                    or not response_id
+                ):
+                    warnings.add("token_record_invalid")
+                    continue
+                if completed_at is not None and timestamp > completed_at:
+                    continue
+                if response_usage is None:
+                    response_usage = _empty_token_usage()
+                if current_turn_id is None:
+                    current_turn_id = payload.get("turn_id")
+                if response_id in response_ids:
+                    continue
+                response_ids.add(response_id)
+                _add_token_usage(observed_response_usage, usage)
+                turn_usage = _usage_counts(payload.get("turn_token_usage"))
+                if timestamp < started_at:
+                    if turn_usage is not None:
+                        observed_response_usage = turn_usage
+                    continue
+                if turn_usage is not None and any(
+                    turn_usage[key] > observed_response_usage[key] for key in TOKEN_FIELDS.values()
+                ):
+                    warnings.add("token_record_incomplete")
+                _add_token_usage(response_usage, usage)
                 continue
             if event.get("type") != "event_msg" or payload.get("type") != "token_count":
                 continue
@@ -492,8 +546,9 @@ def _read_rollout_usage(
                 continue
             if delta["totalTokens"] <= 0:
                 continue
-            _add_token_usage(total, delta)
+            _add_token_usage(legacy_usage, delta)
 
+    _add_token_usage(total, response_usage if response_usage is not None else legacy_usage)
     if not boundary_reached:
         warnings.add("thread_ownership_unavailable")
     return total, warnings
@@ -546,7 +601,10 @@ def _token_snapshot(payload: Mapping[str, Any]) -> dict[str, int] | None:
     info = payload.get("info")
     if not isinstance(info, dict):
         return None
-    usage = info.get("total_token_usage")
+    return _usage_counts(info.get("total_token_usage"))
+
+
+def _usage_counts(usage: object) -> dict[str, int] | None:
     if not isinstance(usage, dict):
         return None
     cache_write = usage.get("cache_write_input_tokens", usage.get("cache_write_tokens", 0))
