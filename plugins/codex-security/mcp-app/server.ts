@@ -1533,7 +1533,11 @@ export function createCodexSecurityServer(): McpServer {
       _meta: modelActionMeta,
     },
     async ({ scanId, handoffClaimToken }, extra) => {
-      const turnId = codexTurnMetadataFromExtra(extra)?.turn_id;
+      const turnMetadata = codexTurnMetadataFromExtra(extra);
+      const turnId =
+        turnMetadata?.thread_source === "security_scan"
+          ? turnMetadata.turn_id
+          : undefined;
       try {
         return scanActionResult(
           await runWorkbench([

@@ -2557,6 +2557,35 @@ export class CodexSecurity {
         });
       }
       const completedScan = completion["scan"];
+      const measuredUsage = isRecord(completedScan)
+        ? completedScan["usage"]
+        : undefined;
+      const usageCompletion = isRecord(measuredUsage)
+        ? measuredUsage["completion"]
+        : undefined;
+      if (
+        isRecord(usageCompletion) &&
+        usageCompletion["finalized"] === false &&
+        typeof usageCompletion["threadId"] === "string" &&
+        typeof usageCompletion["turnId"] === "string"
+      ) {
+        try {
+          await workbench(
+            workbenchOptions,
+            workbenchArgs("finalize-scan-usage", {
+              scanId,
+              threadId: usageCompletion["threadId"],
+              turnId: usageCompletion["turnId"],
+              turnStatus: "completed",
+            }),
+          );
+        } catch (error) {
+          notifyObserver(
+            options,
+            "onWarning",
+          )(`Could not finalize scan token usage: ${errorMessage(error)}`);
+        }
+      }
       if (isRecord(completedScan) && Array.isArray(completedScan["warnings"])) {
         const targetWarnings = new Set([
           ...preparedTargetWarnings,

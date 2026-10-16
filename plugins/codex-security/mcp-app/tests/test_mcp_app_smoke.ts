@@ -539,7 +539,9 @@ async function assertWorkspaceWorksWithoutUiCapability(scope: string) {
   }
 }
 
-async function assertHeadlessStandardScanWorksWithoutUiCapability() {
+async function assertHeadlessStandardScanWorksWithoutUiCapability(
+  threadSource?: string,
+) {
   const headlessStateDir = path.join(tmpdir(), randomUUID());
   const headlessScanRoot = path.join(tmpdir(), randomUUID());
   const headlessServer = startTestServer({
@@ -694,6 +696,7 @@ async function assertHeadlessStandardScanWorksWithoutUiCapability() {
         "x-codex-turn-metadata": {
           thread_id: ownerThread,
           turn_id: "fixture-completion-turn",
+          thread_source: threadSource,
         },
       },
     });
@@ -702,25 +705,35 @@ async function assertHeadlessStandardScanWorksWithoutUiCapability() {
       completed.result.structuredContent.scan.progress.status,
       "complete",
     );
-    assert.deepEqual(completed.result.structuredContent.scan.usage.completion, {
-      threadId: ownerThread,
-      turnId: "fixture-completion-turn",
-      finalized: false,
-    });
-    const finalizedUsage = await headlessServer.callTool(10, {
-      name: "finalize_codex_security_scan_usage",
-      arguments: {
-        scanId: result.scanId,
-        threadId: ownerThread,
-        turnId: "fixture-completion-turn",
-        turnStatus: "completed",
-      },
-    });
-    assertNoError(finalizedUsage);
-    assert.equal(
-      finalizedUsage.result.structuredContent.scan.usage.completion.finalized,
-      true,
-    );
+    if (threadSource === "security_scan") {
+      assert.deepEqual(
+        completed.result.structuredContent.scan.usage.completion,
+        {
+          threadId: ownerThread,
+          turnId: "fixture-completion-turn",
+          finalized: false,
+        },
+      );
+      const finalizedUsage = await headlessServer.callTool(10, {
+        name: "finalize_codex_security_scan_usage",
+        arguments: {
+          scanId: result.scanId,
+          threadId: ownerThread,
+          turnId: "fixture-completion-turn",
+          turnStatus: "completed",
+        },
+      });
+      assertNoError(finalizedUsage);
+      assert.deepEqual(
+        finalizedUsage.result.structuredContent.scan.usage,
+        completed.result.structuredContent.scan.usage,
+      );
+    } else {
+      assert.equal(
+        completed.result.structuredContent.scan.usage.completion,
+        undefined,
+      );
+    }
   } finally {
     await headlessServer.stop();
     await rm(headlessStateDir, { recursive: true, force: true });
@@ -1476,6 +1489,7 @@ try {
   ])
     await assertWorkspaceWorksWithoutUiCapability(scope);
   await assertHeadlessStandardScanWorksWithoutUiCapability();
+  await assertHeadlessStandardScanWorksWithoutUiCapability("security_scan");
   await assertDeepScanPersistsRetryableWorkerStartupError();
   await assertUserInputFailureLogging();
   if (process.platform !== "win32") {

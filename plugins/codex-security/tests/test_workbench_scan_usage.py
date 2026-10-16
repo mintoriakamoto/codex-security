@@ -1271,12 +1271,69 @@ def test_host_final_usage_preserves_missing_worker_warning(
     }
 
 
+def test_host_final_usage_retries_a_locked_native_database_without_losing_counts(
+    tmp_path: Path,
+) -> None:
+    fixture = _start_scan(tmp_path)
+    counted = fixture.started_at + timedelta(microseconds=1)
+    parent = _rollout(
+        tmp_path,
+        "scan-parent",
+        [_response_event(counted, "scan-parent", "first", 10, 2)],
+    )
+    _state_graph(fixture.environment, {"scan-parent": parent}, [])
+    arguments = ("--thread-id", "scan-parent", "--turn-id", "turn-scan-parent")
+    initial = _complete_scan(fixture, *arguments)["scan"]["usage"]
+    with parent.open("a", encoding="utf-8") as output:
+        final_response = _response_event(counted, "scan-parent", "final", 20, 3, turn_usage=(30, 5))
+        output.write(f"{json.dumps(final_response)}\n")
+    with sqlite3.connect(
+        Path(fixture.environment["CODEX_SQLITE_HOME"]) / "state_5.sqlite"
+    ) as native_database:
+        native_database.execute("BEGIN EXCLUSIVE")
+        pending = scan_command(
+            fixture.state_dir,
+            "finalize-scan-usage",
+            fixture.scan_id,
+            *arguments,
+            environment=fixture.environment,
+        )["scan"]["usage"]
+        assert pending == initial
+        assert pending["totalTokens"] == 12
+        assert pending["completion"]["finalized"] is False
+
+    finalized = scan_command(
+        fixture.state_dir,
+        "finalize-scan-usage",
+        fixture.scan_id,
+        *arguments,
+        environment=fixture.environment,
+    )["scan"]["usage"]
+    assert finalized == {
+        "coverage": "complete",
+        "source": "codex_rollout",
+        **_counts(30, 0, 5),
+        "threadCount": 1,
+        "completion": {**initial["completion"], "finalized": True},
+    }
+
+
 def test_host_final_usage_recovers_initially_unavailable_records(tmp_path: Path) -> None:
     fixture = _start_scan(tmp_path)
     arguments = ("--thread-id", "scan-parent", "--turn-id", "turn-scan-parent")
     initial = _complete_scan(fixture, *arguments)["scan"]["usage"]
     assert initial["coverage"] == "unavailable"
     assert initial["completion"]["finalized"] is False
+    assert (
+        scan_command(
+            fixture.state_dir,
+            "finalize-scan-usage",
+            fixture.scan_id,
+            *arguments,
+            environment=fixture.environment,
+        )["scan"]["usage"]
+        == initial
+    )
     _state_graph(
         fixture.environment,
         {

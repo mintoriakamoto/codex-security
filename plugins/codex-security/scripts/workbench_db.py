@@ -1184,6 +1184,8 @@ def finalize_scan_usage(connection: sqlite3.Connection, args: argparse.Namespace
                 thread_id=args.thread_id,
                 completed_turn_id=args.turn_id,
             )
+            if usage["coverage"] == "unavailable":
+                return scan_context(connection, scan_id)
             if args.turn_status != "completed":
                 if usage["coverage"] == "complete":
                     usage["coverage"] = "partial"
