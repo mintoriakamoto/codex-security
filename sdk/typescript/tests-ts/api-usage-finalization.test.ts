@@ -1,7 +1,9 @@
 import { hash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { ThreadEvent } from "@openai/codex-sdk";
 import { afterEach, expect, test } from "bun:test";
+import type { JsonObject } from "../src/config.js";
 import { copyCompletedScan } from "./plugin-root.js";
 import { mockWorkbench, TestClient } from "./support/api-client.js";
 import {
@@ -10,6 +12,7 @@ import {
   scanRuntimeDependencies,
 } from "./support/api-events.js";
 import { createApiTestFixtures } from "./support/temporary-directories.js";
+import { writeSession } from "./support/usage-rollout.js";
 
 const { cleanup, temporaryDirectory } = createApiTestFixtures();
 afterEach(cleanup);
@@ -126,6 +129,179 @@ test.each(["pending", "finalized", "unavailable", "standard"] as const)(
         scenario === "unavailable" ? ["onWarning"] : [],
       );
       expect(commands.some((args) => args[0] === "fail-scan")).toBe(false);
+    } finally {
+      await client.close();
+    }
+  },
+);
+
+test.each([
+  "failed",
+  "interrupted",
+  "post-turn-error",
+  "post-turn-cancel",
+  "transport-error",
+  "resumed",
+  "accounting-error",
+] as const)(
+  "preserves a sealed scan and its %s outcome while finalizing usage",
+  async (scenario) => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const codexHome = join(root, "codex-home");
+    const scanDir = join(root, "scan");
+    await Promise.all(
+      [repository, codexHome, scanDir].map((path) =>
+        mkdir(path, { mode: 0o700 }),
+      ),
+    );
+    const report = "# Sealed scan report\n";
+    await writeFile(join(scanDir, "report.md"), report);
+    if (scenario === "resumed")
+      await writeSession(codexHome, "thread-1", {}, { cwd: scanDir });
+    const controller = new AbortController();
+    const commands: Array<readonly string[]> = [];
+    const warnings: string[] = [];
+    const originalFailure = new Error("Synthetic scan turn failure");
+    const accountingFailure = "Synthetic accounting failure: token=fixture";
+    let turnExited = false;
+    async function* events(): AsyncGenerator<ThreadEvent> {
+      try {
+        if (scenario === "post-turn-error" || scenario === "post-turn-cancel") {
+          yield* completedEvents();
+          if (scenario === "post-turn-cancel")
+            controller.abort(originalFailure);
+          return;
+        }
+        yield { type: "thread.started", thread_id: "thread-1" };
+        yield { type: "turn.started" };
+        if (scenario === "interrupted") {
+          controller.abort(originalFailure);
+          throw originalFailure;
+        }
+        if (scenario === "transport-error") throw originalFailure;
+        yield {
+          type: "turn.failed",
+          error: { message: originalFailure.message },
+        };
+      } finally {
+        turnExited = true;
+      }
+    }
+    const client = TestClient.withDependencies({
+      ...scanRuntimeDependencies(codexHome, scanDir),
+      canRunDirectDeepScan: () => false,
+      createCodex: () => ({
+        startThread: () => ({
+          id: null,
+          runStreamed: async () => ({ events: events() }),
+        }),
+        resumeThread: (threadId) => ({
+          id: threadId,
+          runStreamed: async () => ({ events: events() }),
+        }),
+      }),
+      runWorkbench: async (options, args, input): Promise<JsonObject> => {
+        commands.push(args);
+        if (args[0] === "get-cli-scan-resume") {
+          return {
+            scanId: "scan_example_001",
+            scanDir,
+            targetId: "target_sha256_example",
+            targetRevision: "deadbeef",
+            threadId: "thread-1",
+            recipe: { repository, target: { kind: "repository", paths: [] } },
+            contract: { target: { allowedKinds: ["git_revision"] } },
+          };
+        }
+        if (args[0] === "prepare-scan-completion") throw originalFailure;
+        if (args[0] === "get-scan") {
+          expect(turnExited).toBe(true);
+          if (scenario !== "post-turn-error")
+            expect(options.signal).toBeUndefined();
+          return {
+            scan: {
+              progress: { status: "complete" },
+              usage: {
+                completion: {
+                  threadId: "completion-thread",
+                  turnId: "completion-turn",
+                  finalized: false,
+                },
+              },
+            },
+          };
+        }
+        if (args[0] === "finalize-scan-usage") {
+          expect(turnExited).toBe(true);
+          expect(options.signal).toBeUndefined();
+          if (scenario === "accounting-error")
+            throw new Error(accountingFailure);
+        }
+        return mockWorkbench(args, input);
+      },
+    });
+    try {
+      const failure = await client
+        .run(repository, {
+          mode: "deep",
+          ...(scenario === "resumed"
+            ? { resumeScanId: "scan_example_001", outputDir: scanDir }
+            : {}),
+          signal: controller.signal,
+          onWarning: (warning) => {
+            warnings.push(warning);
+            throw new Error("Synthetic warning observer failure");
+          },
+        })
+        .then(
+          () => {
+            throw new Error("Expected the original scan failure");
+          },
+          (error: unknown) => error,
+        );
+      if (scenario === "interrupted" || scenario === "post-turn-cancel") {
+        expect(failure).toMatchObject({ name: "ScanInterruptedError" });
+      } else if (
+        scenario === "post-turn-error" ||
+        scenario === "transport-error"
+      ) {
+        expect(failure).toBe(originalFailure);
+      } else {
+        expect(failure).toMatchObject({ message: originalFailure.message });
+      }
+      const finalization = commands.filter(
+        (args) => args[0] === "finalize-scan-usage",
+      );
+      expect(finalization).toEqual(
+        scenario === "transport-error"
+          ? []
+          : [
+              [
+                "finalize-scan-usage",
+                "--scan-id",
+                "scan_example_001",
+                "--thread-id",
+                "completion-thread",
+                "--turn-id",
+                "completion-turn",
+                "--turn-status",
+                scenario === "post-turn-error" ||
+                scenario === "post-turn-cancel"
+                  ? "completed"
+                  : scenario === "interrupted"
+                    ? "interrupted"
+                    : "failed",
+              ],
+            ],
+      );
+      expect(commands.some((args) => args[0] === "fail-scan")).toBe(false);
+      expect(warnings).toEqual(
+        scenario === "accounting-error"
+          ? [`Could not finalize scan token usage: ${accountingFailure}`]
+          : [],
+      );
+      expect(await readFile(join(scanDir, "report.md"), "utf8")).toBe(report);
     } finally {
       await client.close();
     }
